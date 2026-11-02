@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>주식 연구실</title>
+<style>
+:root{
+  --bg:#f3f5f8; --panel:#ffffff; --ink:#1b2430; --sub:#6b7686; --line:#dde2ea;
+  --up:#e5383b; --down:#2b6fd6; --accent:#1b2430; --accent-ink:#ffffff; --grid:#eceff4;
+}
+@media (prefers-color-scheme: dark){
+  :root{ --bg:#12161c; --panel:#1b212a; --ink:#e7ebf1; --sub:#8c97a8; --line:#2b3340;
+    --up:#ff5d5f; --down:#5b98ff; --accent:#e7ebf1; --accent-ink:#12161c; --grid:#242b36; }
+}
+*{box-sizing:border-box}
+html,body{margin:0}
+body{background:var(--bg);color:var(--ink);font:15px/1.5 -apple-system,"Apple SD Gothic Neo","Noto Sans KR","Malgun Gothic",sans-serif}
+main{max-width:980px;margin:0 auto;padding:12px}
+header{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+h1{font-size:18px;margin:0}
+.sync{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--sub)}
+button{font:inherit;color:var(--ink);background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:6px 12px;cursor:pointer}
+button:focus-visible,input:focus-visible{outline:2px solid var(--down);outline-offset:2px}
+button.primary{background:var(--accent);color:var(--accent-ink);border-color:var(--accent)}
+button.on{background:var(--accent);color:var(--accent-ink);border-color:var(--accent)}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px;margin-bottom:10px}
+.watch{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.chip{display:inline-flex;align-items:center;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.chip button{border:0;border-radius:0;background:transparent}
+.chip button.x{color:var(--sub);padding:6px 9px}
+.chip.sel{border-color:var(--accent)}
+.chip.sel button:first-child{background:var(--accent);color:var(--accent-ink)}
+.add{display:flex;gap:6px;margin-top:8px;flex-wrap:wrap}
+input{font:inherit;color:var(--ink);background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:6px 10px;min-width:0}
+input.code{width:100px}input.nm{flex:1;min-width:100px}
+.bar{display:flex;justify-content:space-between;align-items:baseline;gap:8px;flex-wrap:wrap;margin-bottom:6px}
+.title{font-size:17px;font-weight:600}
+.info{font-size:13px;color:var(--sub);font-variant-numeric:tabular-nums}
+.ranges{display:flex;gap:6px}
+#wrap{position:relative;width:100%;height:min(62vh,460px);touch-action:pan-y}
+canvas{width:100%;height:100%;display:block}
+.note{font-size:12px;color:var(--sub);margin:6px 2px 0}
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>주식 연구실</h1>
+    <div class="sync">
+      <span id="status">이 기기에만 저장 중</span>
+      <button id="login" class="primary">구글 로그인</button>
+    </div>
+  </header>
+
+  <section class="card">
+    <div class="watch" id="watch"></div>
+    <div class="add">
+      <input class="code" id="inCode" placeholder="종목코드" inputmode="numeric" maxlength="6" aria-label="종목코드">
+      <input class="nm" id="inName" placeholder="종목명" aria-label="종목명">
+      <button id="btnAdd">관심 종목 추가</button>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="bar">
+      <div class="title" id="ttl">종목을 선택하세요</div>
+      <div class="ranges" id="ranges"></div>
+    </div>
+    <div class="info" id="info">&nbsp;</div>
+    <div id="wrap"><canvas id="cv"></canvas></div>
+    <div class="note" id="srcNote"></div>
+  </section>
+</main>
+
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+<script>
+/* ============ 설정 ============ */
+// 구글 클라우드에서 발급받은 웹 클라이언트 ID를 아래에 붙여넣으세요.
+const CLIENT_ID = '여기에_구글_클라이언트_ID';
+const SCOPE = 'https://www.googleapis.com/auth/drive.appdata'; // 앱이 만든 파일만 접근
+const DRIVE_FILE = 'naru-stock.json';
+const LS_KEY = 'naru_stock_v1';
+const PRICE_URL = 'data/prices.json'; // GitHub Actions가 매일 갱신할 파일
+
+/* ============ 저장소 (기기 + 구글 드라이브) ============ */
+// 모든 기록은 items[id] = {id, type, ..., updatedAt, deleted?} 형태.
+// 합칠 때는 같은 id끼리 updatedAt이 더 최근인 쪽을 씁니다.
+let store = loadLocal();
+let token = null, tokenClient = null, syncTimer = null, syncing = false;
+
+function loadLocal(){
+  try{ const s = JSON.parse(localStorage.getItem(LS_KEY)); if(s && s.items) return s; }catch(e){}
+  return {items:{}};
+}
+function saveLocal(){ try{ localStorage.setItem(LS_KEY, JSON.stringify(store)); }catch(e){} }
+function put(item){
+  item.updatedAt = Date.now();
+  store.items[item.id] = item;
+  saveLocal();
+  scheduleSync();
+}
+function live(type){
+  return Object.values(store.items).filter(i => i.type===type && !i.deleted)
+    .sort((a,b)=>a.createdAt-b.createdAt);
+}
+function merge(remote){
+  let changed = false;
+  for(const [id, r] of Object.entries(remote.items||{})){
+    const l = store.items[id];
+    if(!l || r.updatedAt > l.updatedAt){ store.items[id] = r; changed = true; }
+  }
+  return changed;
+}
+function uid(){ return Date.now().toString(36)+Math.random().toString(36).slice(2,7); }
+
+/* ---- 구글 드라이브 ---- */
+const $status = document.getElementById('status');
+const $login = document.getElementById('login');
+function setStatus(t){ $status.textContent = t; }
+
+function initGoogle(){
+  if(!window.google || !google.accounts){ return setTimeout(initGoogle, 400); }
+  if(CLIENT_ID.startsWith('여기에')) { setStatus('이 기기에만 저장 중 (구글 ID 설정 전)'); return; }
+  tokenClient = google.accounts.oauth2.initTokenClient({
+    client_id: CLIENT_ID, scope: SCOPE,
+    callback: resp => {
+      if(resp.error){ setStatus('로그인 실패: '+resp.error); return; }
+      token = resp.access_token;
+      $login.textContent = '로그아웃';
+      syncNow();
+    }
+  });
+}
+$login.onclick = () => {
+  if(token){
+    google.accounts.oauth2.revoke(token, ()=>{});
+    token = null; $login.textContent = '구글 로그인'; setStatus('이 기기에만 저장 중'); return;
+  }
+  if(!tokenClient){ setStatus('구글 ID를 먼저 설정해야 합니다'); return; }
+  tokenClient.requestAccessToken();
+};
+
+async function g(url, opt={}){
+  const r = await fetch(url, {...opt, headers:{Authorization:'Bearer '+token, ...(opt.headers||{})}});
+  if(r.status===401){ token=null; $login.textContent='구글 로그인'; throw new Error('로그인이 만료됐어요. 다시 로그인해 주세요'); }
+  if(!r.ok) throw new Error('드라이브 오류 '+r.status);
+  return r;
+}
+async function findFile(){
+  const q = encodeURIComponent(`name='${DRIVE_FILE}'`);
+  const r = await g(`https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&q=${q}&fields=files(id)`);
+  const j = await r.json();
+  return j.files && j.files[0] ? j.files[0].id : null;
+}
+async function upload(fileId){
+  const body = JSON.stringify(store);
+  if(fileId){
+    await g(`https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`,
+      {method:'PATCH', headers:{'Content-Type':'application/json'}, body});
+  }else{
+    const b='naru'+uid();
+    const meta = JSON.stringify({name:DRIVE_FILE, parents:['appDataFolder']});
+    const multi = `--${b}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${meta}\r\n`+
+      `--${b}\r\nContent-Type: application/json\r\n\r\n${body}\r\n--${b}--`;
+    await g('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart',
+      {method:'POST', headers:{'Content-Type':'multipart/related; boundary='+b}, body:multi});
+  }
+}
+async function syncNow(){
+  if(!token || syncing) return;
+  syncing = true; setStatus('동기화 중…');
+  try{
+    const id = await findFile();
+    if(id){
+      const r = await g(`https://www.googleapis.com/drive/v3/files/${id}?alt=media`);
+      const remote = await r.json();
+      if(merge(remote)){ saveLocal(); renderAll(); }
+    }
+    await upload(id);
+    setStatus('구글 드라이브에 저장됨 '+new Date().toLocaleTimeString('ko-KR',{hour:'2-digit',minute:'2-digit'}));
+  }catch(e){ setStatus(e.message || '동기화 실패 (이 기기에는 저장됨)'); }
+  syncing = false;
+}
+function scheduleSync(){
+  if(!token) return;
+  clearTimeout(syncTimer); syncTimer = setTimeout(syncNow, 2000);
+}
+window.addEventListener('online', ()=>{ if(token) syncNow(); });
+
+/* ============ 주가 데이터 ============ */
+// 형식: { "005930": { "name":"삼성전자", "candles":[["2026-01-02", 시가, 고가, 저가, 종가, 거래량], ...] } }
+let PRICES = null, usingSample = false;
+async function loadPrices(){
+  try{
+    const r = await fetch(PRICE_URL, {cache:'no-cache'});
+    if(r.ok) PRICES = await r.json();
+  }catch(e){}
+}
+function sampleCandles(code){ // 데이터 파일이 없을 때 쓰는 연습용 가짜 데이터
+  let seed = 0; for(const c of code) seed = (seed*31 + c.charCodeAt(0)) >>> 0;
+  const rnd = () => (seed = (seed*1664525 + 1013904223) >>> 0) / 4294967296;
+  const out = []; let p = 20000 + rnd()*60000; const d = new Date('2025-11-03');
+  while(out.length < 260){
+    d.setDate(d.getDate()+1); if(d.getDay()===0||d.getDay()===6) continue;
+    const o = p, c = Math.max(500, o*(1+(rnd()-0.48)*0.05));
+    const h = Math.max(o,c)*(1+rnd()*0.015), l = Math.min(o,c)*(1-rnd()*0.015);
+    const tick = c>50000?100:50;
+    const R = v => Math.round(v/tick)*tick;
+    out.push([d.toISOString().slice(0,10), R(o), R(h), R(l), R(c), Math.round(100000+rnd()*900000)]);
+    p = c;
+  }
+  return out;
+}
+function candlesFor(code){
+  if(PRICES && PRICES[code] && PRICES[code].candles.length){ usingSample=false; return PRICES[code].candles; }
+  usingSample = true; return sampleCandles(code);
+}
+
+/* ============ 화면 ============ */
+const $watch = document.getElementById('watch');
+const $ttl = document.getElementById('ttl');
+const $info = document.getElementById('info');
+const $ranges = document.getElementById('ranges');
+const $note = document.getElementById('srcNote');
+const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+
+let selCode = null, candles = [], hoverIdx = -1;
+
+function settings(){ return store.items['set:main'] || {id:'set:main', type:'set', createdAt:0, days:120, last:null}; }
+function patchSettings(p){ put({...settings(), ...p}); }
+
+function renderWatch(){
+  $watch.innerHTML = '';
+  const list = live('watch');
+  if(!list.length){ $watch.innerHTML = '<span class="info">아직 관심 종목이 없어요. 아래에서 추가하세요.</span>'; return; }
+  for(const w of list){
+    const el = document.createElement('div');
+    el.className = 'chip'+(w.code===selCode?' sel':'');
+    const b = document.createElement('button'); b.textContent = w.name||w.code;
+    b.onclick = () => select(w.code);
+    const x = document.createElement('button'); x.className='x'; x.textContent='×'; x.title='삭제'; x.setAttribute('aria-label',(w.name||w.code)+' 삭제');
+    x.onclick = () => { put({...w, deleted:true}); if(selCode===w.code) selCode=null; renderAll(); };
+    el.append(b,x); $watch.append(el);
+  }
+}
+function renderRanges(){
+  $ranges.innerHTML='';
+  for(const n of [30,60,120,250]){
+    const b=document.createElement('button'); b.textContent=n+'일';
+    if(settings().days===n) b.className='on';
+    b.onclick=()=>{ patchSettings({days:n}); renderRanges(); draw(); };
+    $ranges.append(b);
+  }
+}
+function select(code){
+  selCode = code; hoverIdx = -1;
+  candles = candlesFor(code);
+  const w = live('watch').find(x=>x.code===code);
+  $ttl.textContent = (w&&w.name?w.name+' ':'')+code;
+  $note.textContent = usingSample ? '※ 연습용 샘플 데이터입니다. 실제 주가는 data/prices.json 이 올라오면 표시돼요.' : '';
+  patchSettings({last:code});
+  renderWatch(); draw();
+}
+function renderAll(){
+  renderWatch(); renderRanges();
+  const last = settings().last;
+  if(!selCode){
+    const list = live('watch');
+    const pick = list.find(w=>w.code===last) || list[0];
+    if(pick){ selCode=pick.code; candles=candlesFor(selCode); $ttl.textContent=(pick.name?pick.name+' ':'')+pick.code; $note.textContent = usingSample?'※ 연습용 샘플 데이터입니다. 실제 주가는 data/prices.json 이 올라오면 표시돼요.':''; renderWatch(); }
+  }
+  draw();
+}
+
+document.getElementById('btnAdd').onclick = () => {
+  const code = document.getElementById('inCode').value.trim();
+  const name = document.getElementById('inName').value.trim();
+  if(!/^\d{6}$/.test(code)){ alert('종목코드는 숫자 6자리예요. 예: 005930'); return; }
+  if(live('watch').some(w=>w.code===code)){ select(code); return; }
+  put({id:'watch:'+code, type:'watch', code, name: name || (PRICES&&PRICES[code]?PRICES[code].name:''), createdAt:Date.now()});
+  document.getElementById('inCode').value=''; document.getElementById('inName').value='';
+  select(code);
+};
+
+/* ============ 차트 ============ */
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const fmt = n => Math.round(n).toLocaleString('ko-KR');
+
+function draw(){
+  const dpr = window.devicePixelRatio||1;
+  const W = cv.clientWidth, H = cv.clientHeight;
+  cv.width = W*dpr; cv.height = H*dpr; ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.clearRect(0,0,W,H);
+  if(!selCode || !candles.length){ ctx.fillStyle=css('--sub'); ctx.font='14px sans-serif'; ctx.fillText('관심 종목을 추가하고 선택하세요',16,28); $info.innerHTML='&nbsp;'; return; }
+
+  const n = Math.min(settings().days, candles.length);
+  const vis = candles.slice(-n);
+  const padR = 58, padB = 20, padT = 8;
+  const volH = Math.round(H*0.2), gap = 8;
+  const priceH = H - padB - padT - volH - gap;
+  const cw = (W-padR)/n;
+
+  let hi=-Infinity, lo=Infinity, vmax=0;
+  for(const c of vis){ hi=Math.max(hi,c[2]); lo=Math.min(lo,c[3]); vmax=Math.max(vmax,c[5]); }
+  const span = (hi-lo)||1; hi+=span*0.04; lo-=span*0.04;
+  const y = v => padT + (hi-v)/(hi-lo)*priceH;
+  const vy = v => padT+priceH+gap+volH - v/vmax*volH;
+
+  const up=css('--up'), down=css('--down'), grid=css('--grid'), sub=css('--sub');
+  ctx.font='11px sans-serif'; ctx.textBaseline='middle';
+
+  // 가로 눈금
+  for(let i=0;i<=4;i++){
+    const v = lo+(hi-lo)*i/4, yy=y(v);
+    ctx.strokeStyle=grid; ctx.lineWidth=1; ctx.beginPath(); ctx.moveTo(0,yy); ctx.lineTo(W-padR,yy); ctx.stroke();
+    ctx.fillStyle=sub; ctx.textAlign='left'; ctx.fillText(fmt(v), W-padR+6, yy);
+  }
+  // 날짜 눈금
+  ctx.textAlign='center'; ctx.textBaseline='alphabetic';
+  const step = Math.max(1, Math.round(n/5));
+  for(let i=0;i<n;i+=step){ ctx.fillStyle=sub; ctx.fillText(vis[i][0].slice(2), i*cw+cw/2, H-4); }
+  ctx.textBaseline='middle';
+
+  // 캔들 + 거래량 (한국식: 상승 빨강, 하락 파랑)
+  vis.forEach((c,i)=>{
+    const [,o,h,l,cl,v] = c; const x=i*cw+cw/2; const col = cl>=o?up:down;
+    ctx.strokeStyle=col; ctx.fillStyle=col; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(x,y(h)); ctx.lineTo(x,y(l)); ctx.stroke();
+    const bw=Math.max(1,cw*0.66), top=y(Math.max(o,cl)), bh=Math.max(1,Math.abs(y(o)-y(cl)));
+    ctx.fillRect(x-bw/2, top, bw, bh);
+    ctx.globalAlpha=0.55; ctx.fillRect(x-bw/2, vy(v), bw, padT+priceH+gap+volH-vy(v)); ctx.globalAlpha=1;
+  });
+
+  // 십자선
+  const hi_i = hoverIdx>=0 ? Math.min(hoverIdx,n-1) : n-1;
+  const c = vis[hi_i], prev = hi_i>0 ? vis[hi_i-1] : null;
+  if(hoverIdx>=0){
+    const x=hi_i*cw+cw/2;
+    ctx.strokeStyle=sub; ctx.setLineDash([3,3]); ctx.beginPath(); ctx.moveTo(x,padT); ctx.lineTo(x,H-padB); ctx.stroke(); ctx.setLineDash([]);
+  }
+  const chg = prev ? (c[4]/prev[4]-1)*100 : 0;
+  $info.innerHTML = `${c[0]} · 시 ${fmt(c[1])} 고 ${fmt(c[2])} 저 ${fmt(c[3])} 종 <b style="color:${chg>=0?up:down}">${fmt(c[4])}${prev?` (${chg>=0?'+':''}${chg.toFixed(2)}%)`:''}</b> · 거래량 ${fmt(c[5])}`;
+}
+function pointerMove(e){
+  const rect = cv.getBoundingClientRect();
+  const n = Math.min(settings().days, candles.length);
+  const cw = (rect.width-58)/n;
+  const i = Math.floor((e.clientX-rect.left)/cw);
+  hoverIdx = (i>=0 && i<n) ? i : -1; draw();
+}
+cv.addEventListener('pointermove', pointerMove);
+cv.addEventListener('pointerdown', pointerMove);
+cv.addEventListener('pointerleave', ()=>{ hoverIdx=-1; draw(); });
+window.addEventListener('resize', draw);
+matchMedia('(prefers-color-scheme: dark)').addEventListener('change', draw);
+
+/* ============ 시작 ============ */
+(async function(){
+  await loadPrices();
+  renderAll();
+  initGoogle();
+})();
+</script>
+</body>
+</html>
