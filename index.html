@@ -41,6 +41,13 @@ input.code{width:100px}input.nm{flex:1;min-width:100px}
 #wrap{position:relative;width:100%;height:min(62vh,460px);touch-action:pan-y}
 canvas{width:100%;height:100%;display:block}
 .note{font-size:12px;color:var(--sub);margin:6px 2px 0}
+[hidden]{display:none!important}
+.replay{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin:8px 0 4px}
+.replay span{display:inline-flex;gap:6px}
+.rules{display:flex;gap:12px;flex-wrap:wrap}
+.rules label{display:flex;flex-direction:column;gap:4px;font-size:13px;color:var(--sub)}
+.rules input{width:110px}
+.ruleinfo{font-size:13px;color:var(--ink);margin-top:4px;font-variant-numeric:tabular-nums}
 </style>
 </head>
 <body>
@@ -68,8 +75,25 @@ canvas{width:100%;height:100%;display:block}
       <div class="ranges" id="ranges"></div>
     </div>
     <div class="info" id="info">&nbsp;</div>
+    <div class="ruleinfo" id="ruleinfo"></div>
+    <div class="replay">
+      <button id="btnRep">복기 모드</button>
+      <span id="repCtl" hidden>
+        <button id="repBack">◀ 하루</button><button id="repFwd">하루 ▶</button><button id="repEnd">끝으로</button>
+      </span>
+    </div>
     <div id="wrap"><canvas id="cv"></canvas></div>
     <div class="note" id="srcNote"></div>
+  </section>
+
+  <section class="card">
+    <div class="title" style="font-size:15px;margin-bottom:8px">규칙 수치</div>
+    <div class="rules">
+      <label>박스 기간(일)<input type="number" id="rN" min="5" max="120" step="1"></label>
+      <label>박스 폭 한도(%)<input type="number" id="rPct" min="1" max="50" step="0.5"></label>
+      <label>돌파 거래량(평균의 몇 배)<input type="number" id="rVol" min="0.5" max="10" step="0.1"></label>
+    </div>
+    <div class="note">이 수치는 구글 드라이브(로그인 시)와 이 기기에만 저장되고, GitHub에는 올라가지 않아요.</div>
   </section>
 </main>
 
@@ -224,6 +248,7 @@ const $ttl = document.getElementById('ttl');
 const $info = document.getElementById('info');
 const $ranges = document.getElementById('ranges');
 const $note = document.getElementById('srcNote');
+const $ruleinfo = document.getElementById('ruleinfo');
 const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
 
 let selCode = null, candles = [], hoverIdx = -1;
@@ -255,16 +280,16 @@ function renderRanges(){
   }
 }
 function select(code){
-  selCode = code; hoverIdx = -1;
+  selCode = code; hoverIdx = -1; replay=false; cur=-1;
   candles = candlesFor(code);
   const w = live('watch').find(x=>x.code===code);
   $ttl.textContent = (nameOf(code,w)?nameOf(code,w)+' ':'')+code;
   $note.textContent = usingSample ? '※ 연습용 샘플 데이터입니다. 실제 주가는 data/prices.json 이 올라오면 표시돼요.' : '';
   patchSettings({last:code});
-  renderWatch(); draw();
+  updateRep(); renderWatch(); draw();
 }
 function renderAll(){
-  renderWatch(); renderRanges();
+  renderWatch(); renderRanges(); fillRule();
   const last = settings().last;
   if(!selCode){
     const list = live('watch');
@@ -288,15 +313,42 @@ document.getElementById('btnAdd').onclick = () => {
 const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
 const fmt = n => Math.round(n).toLocaleString('ko-KR');
 
+/* --- 규칙 계산 (범용 부품: 기간 고저 박스, 중간선, 거래량 비교). 수치는 설정에서 읽음 --- */
+const RULE_DEFAULT = {n:20, pct:12, volK:1.5};
+function rule(){
+  const s = settings().rule || {};
+  const num = (v,d,lo,hi)=> (typeof v==='number' && isFinite(v)) ? Math.min(hi,Math.max(lo,v)) : d;
+  return { n:Math.round(num(s.n,RULE_DEFAULT.n,5,120)), pct:num(s.pct,RULE_DEFAULT.pct,1,50), volK:num(s.volK,RULE_DEFAULT.volK,0.5,10) };
+}
+// i번째 봉 직전 n개 봉으로 만든 박스 (i번째 이후 데이터는 쓰지 않음)
+function boxAt(full, i, r){
+  if(i < r.n) return null;
+  let hi=-Infinity, lo=Infinity, vs=0;
+  for(let j=i-r.n;j<i;j++){ hi=Math.max(hi,full[j][2]); lo=Math.min(lo,full[j][3]); vs+=full[j][5]; }
+  const w=(hi-lo)/lo*100;
+  return {hi, lo, mid:(hi+lo)/2, w, isBox:w<=r.pct, avgV:vs/r.n};
+}
+function breakoutAt(full, i, r){
+  const b=boxAt(full,i,r);
+  return !!(b && b.isBox && full[i][4]>b.hi && full[i][5]>=r.volK*b.avgV);
+}
+
+/* --- 복기 모드: 선택한 날 이후의 캔들을 가리고 하루씩 넘김 --- */
+let replay=false, cur=-1;
+function fullView(){ return (replay && cur>=0) ? candles.slice(0,cur+1) : candles; }
+
 function draw(){
   const dpr = window.devicePixelRatio||1;
   const W = cv.clientWidth, H = cv.clientHeight;
   cv.width = W*dpr; cv.height = H*dpr; ctx.setTransform(dpr,0,0,dpr,0,0);
   ctx.clearRect(0,0,W,H);
-  if(!selCode || !candles.length){ ctx.fillStyle=css('--sub'); ctx.font='14px sans-serif'; ctx.fillText('관심 종목을 추가하고 선택하세요',16,28); $info.innerHTML='&nbsp;'; return; }
+  const full = fullView();
+  if(!selCode || !full.length){ ctx.fillStyle=css('--sub'); ctx.font='14px sans-serif'; ctx.fillText('관심 종목을 추가하고 선택하세요',16,28); $info.innerHTML='&nbsp;'; $ruleinfo.textContent=''; return; }
 
-  const n = Math.min(settings().days, candles.length);
-  const vis = candles.slice(-n);
+  const r = rule();
+  const n = Math.min(settings().days, full.length);
+  const off = full.length - n;
+  const vis = full.slice(-n);
   const padR = 58, padB = 20, padT = 8;
   const volH = Math.round(H*0.2), gap = 8;
   const priceH = H - padB - padT - volH - gap;
@@ -304,6 +356,10 @@ function draw(){
 
   let hi=-Infinity, lo=Infinity, vmax=0;
   for(const c of vis){ hi=Math.max(hi,c[2]); lo=Math.min(lo,c[3]); vmax=Math.max(vmax,c[5]); }
+  const L = full.length-1;
+  const bx = boxAt(full, L, r);
+  const boxOn = !!(bx && bx.isBox);
+  if(boxOn){ hi=Math.max(hi,bx.hi); lo=Math.min(lo,bx.lo); }
   const span = (hi-lo)||1; hi+=span*0.04; lo-=span*0.04;
   const y = v => padT + (hi-v)/(hi-lo)*priceH;
   const vy = v => padT+priceH+gap+volH - v/vmax*volH;
@@ -311,19 +367,26 @@ function draw(){
   const up=css('--up'), down=css('--down'), grid=css('--grid'), sub=css('--sub');
   ctx.font='11px sans-serif'; ctx.textBaseline='middle';
 
-  // 가로 눈금
   for(let i=0;i<=4;i++){
     const v = lo+(hi-lo)*i/4, yy=y(v);
     ctx.strokeStyle=grid; ctx.lineWidth=1; ctx.beginPath(); ctx.moveTo(0,yy); ctx.lineTo(W-padR,yy); ctx.stroke();
     ctx.fillStyle=sub; ctx.textAlign='left'; ctx.fillText(fmt(v), W-padR+6, yy);
   }
-  // 날짜 눈금
   ctx.textAlign='center'; ctx.textBaseline='alphabetic';
   const step = Math.max(1, Math.round(n/5));
   for(let i=0;i<n;i+=step){ ctx.fillStyle=sub; ctx.fillText(vis[i][0].slice(2), i*cw+cw/2, H-4); }
   ctx.textBaseline='middle';
 
-  // 캔들 + 거래량 (한국식: 상승 빨강, 하락 파랑)
+  // 박스 + 중간선 (가장 최근 봉 기준)
+  if(boxOn){
+    const xs = Math.max(0, L-r.n-off)*cw, xe = (L-off)*cw+cw;
+    ctx.globalAlpha=0.10; ctx.fillStyle=down; ctx.fillRect(xs,y(bx.hi),xe-xs,y(bx.lo)-y(bx.hi)); ctx.globalAlpha=1;
+    ctx.strokeStyle=down; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(xs,y(bx.hi)); ctx.lineTo(xe,y(bx.hi)); ctx.moveTo(xs,y(bx.lo)); ctx.lineTo(xe,y(bx.lo)); ctx.stroke();
+    ctx.setLineDash([5,4]); ctx.beginPath(); ctx.moveTo(xs,y(bx.mid)); ctx.lineTo(xe,y(bx.mid)); ctx.stroke(); ctx.setLineDash([]);
+  }
+
+  // 캔들 + 거래량 + 돌파 표시
   vis.forEach((c,i)=>{
     const [,o,h,l,cl,v] = c; const x=i*cw+cw/2; const col = cl>=o?up:down;
     ctx.strokeStyle=col; ctx.fillStyle=col; ctx.lineWidth=1;
@@ -331,21 +394,29 @@ function draw(){
     const bw=Math.max(1,cw*0.66), top=y(Math.max(o,cl)), bh=Math.max(1,Math.abs(y(o)-y(cl)));
     ctx.fillRect(x-bw/2, top, bw, bh);
     ctx.globalAlpha=0.55; ctx.fillRect(x-bw/2, vy(v), bw, padT+priceH+gap+volH-vy(v)); ctx.globalAlpha=1;
+    if(breakoutAt(full, i+off, r)){
+      const ty=y(l)+6, s=Math.max(4,Math.min(7,cw*0.5));
+      ctx.fillStyle=css('--ink'); ctx.beginPath(); ctx.moveTo(x,ty); ctx.lineTo(x-s,ty+s*1.6); ctx.lineTo(x+s,ty+s*1.6); ctx.closePath(); ctx.fill();
+    }
   });
 
-  // 십자선
   const hi_i = hoverIdx>=0 ? Math.min(hoverIdx,n-1) : n-1;
-  const c = vis[hi_i], prev = hi_i>0 ? vis[hi_i-1] : null;
+  const c = vis[hi_i], prev = hi_i>0 ? vis[hi_i-1] : (off>0 ? full[off-1] : null);
   if(hoverIdx>=0){
     const x=hi_i*cw+cw/2;
     ctx.strokeStyle=sub; ctx.setLineDash([3,3]); ctx.beginPath(); ctx.moveTo(x,padT); ctx.lineTo(x,H-padB); ctx.stroke(); ctx.setLineDash([]);
   }
   const chg = prev ? (c[4]/prev[4]-1)*100 : 0;
   $info.innerHTML = `${c[0]} · 시 ${fmt(c[1])} 고 ${fmt(c[2])} 저 ${fmt(c[3])} 종 <b style="color:${chg>=0?up:down}">${fmt(c[4])}${prev?` (${chg>=0?'+':''}${chg.toFixed(2)}%)`:''}</b> · 거래량 ${fmt(c[5])}`;
+
+  // 박스 상태 한 줄 (기준: 화면에 보이는 마지막 봉)
+  if(!bx) $ruleinfo.textContent = '박스 계산에 필요한 데이터가 부족해요';
+  else if(boxOn) $ruleinfo.textContent = `박스 중 · ${fmt(bx.lo)} ~ ${fmt(bx.hi)} · 중간선 ${fmt(bx.mid)} · 폭 ${bx.w.toFixed(1)}%` + (breakoutAt(full,L,r)?' · ▲ 돌파':'');
+  else $ruleinfo.textContent = `박스 아님 · 최근 ${r.n}일 폭 ${bx.w.toFixed(1)}% (한도 ${r.pct}%)`;
 }
 function pointerMove(e){
   const rect = cv.getBoundingClientRect();
-  const n = Math.min(settings().days, candles.length);
+  const n = Math.min(settings().days, fullView().length);
   const cw = (rect.width-58)/n;
   const i = Math.floor((e.clientX-rect.left)/cw);
   hoverIdx = (i>=0 && i<n) ? i : -1; draw();
@@ -355,6 +426,39 @@ cv.addEventListener('pointerdown', pointerMove);
 cv.addEventListener('pointerleave', ()=>{ hoverIdx=-1; draw(); });
 window.addEventListener('resize', draw);
 matchMedia('(prefers-color-scheme: dark)').addEventListener('change', draw);
+
+/* ============ 복기 조작 / 규칙 수치 입력 ============ */
+const $btnRep=document.getElementById('btnRep'), $repCtl=document.getElementById('repCtl');
+function updateRep(){ $repCtl.hidden=!replay; $btnRep.className=replay?'on':''; $btnRep.textContent=replay?'복기 끄기':'복기 모드'; }
+function repStep(d){ if(!replay) return; cur=Math.min(candles.length-1, Math.max(20, cur+d)); hoverIdx=-1; draw(); }
+$btnRep.onclick=()=>{
+  replay=!replay;
+  if(replay){ cur=Math.max(30, candles.length-61); cur=Math.min(cur, candles.length-1); }
+  hoverIdx=-1; updateRep(); draw();
+};
+document.getElementById('repBack').onclick=()=>repStep(-1);
+document.getElementById('repFwd').onclick=()=>repStep(1);
+document.getElementById('repEnd').onclick=()=>{ if(replay){ cur=candles.length-1; draw(); } };
+document.addEventListener('keydown',e=>{
+  if(e.target.tagName==='INPUT') return;
+  if(e.key==='ArrowRight') repStep(1); else if(e.key==='ArrowLeft') repStep(-1);
+});
+
+const $rN=document.getElementById('rN'), $rPct=document.getElementById('rPct'), $rVol=document.getElementById('rVol');
+function fillRule(){
+  const r=rule();
+  if(document.activeElement!==$rN) $rN.value=r.n;
+  if(document.activeElement!==$rPct) $rPct.value=r.pct;
+  if(document.activeElement!==$rVol) $rVol.value=r.volK;
+}
+function saveRule(){
+  const cur0=rule();
+  const n=parseFloat($rN.value), pct=parseFloat($rPct.value), volK=parseFloat($rVol.value);
+  patchSettings({rule:{
+    n: isFinite(n)?n:cur0.n, pct: isFinite(pct)?pct:cur0.pct, volK: isFinite(volK)?volK:cur0.volK }});
+  draw();
+}
+[$rN,$rPct,$rVol].forEach(el=>el.addEventListener('change',()=>{ saveRule(); fillRule(); }));
 
 /* ============ 시작 ============ */
 (async function(){
