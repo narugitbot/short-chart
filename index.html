@@ -212,6 +212,7 @@ function sampleCandles(code){ // 데이터 파일이 없을 때 쓰는 연습용
   }
   return out;
 }
+function nameOf(code, w){ return (w&&w.name) || (PRICES&&PRICES[code]&&PRICES[code].name) || ''; }
 function candlesFor(code){
   if(PRICES && PRICES[code] && PRICES[code].candles.length){ usingSample=false; return PRICES[code].candles; }
   usingSample = true; return sampleCandles(code);
@@ -237,9 +238,9 @@ function renderWatch(){
   for(const w of list){
     const el = document.createElement('div');
     el.className = 'chip'+(w.code===selCode?' sel':'');
-    const b = document.createElement('button'); b.textContent = w.name||w.code;
+    const b = document.createElement('button'); b.textContent = nameOf(w.code,w)||w.code;
     b.onclick = () => select(w.code);
-    const x = document.createElement('button'); x.className='x'; x.textContent='×'; x.title='삭제'; x.setAttribute('aria-label',(w.name||w.code)+' 삭제');
+    const x = document.createElement('button'); x.className='x'; x.textContent='×'; x.title='삭제'; x.setAttribute('aria-label',(nameOf(w.code,w)||w.code)+' 삭제');
     x.onclick = () => { put({...w, deleted:true}); if(selCode===w.code) selCode=null; renderAll(); };
     el.append(b,x); $watch.append(el);
   }
@@ -257,7 +258,7 @@ function select(code){
   selCode = code; hoverIdx = -1;
   candles = candlesFor(code);
   const w = live('watch').find(x=>x.code===code);
-  $ttl.textContent = (w&&w.name?w.name+' ':'')+code;
+  $ttl.textContent = (nameOf(code,w)?nameOf(code,w)+' ':'')+code;
   $note.textContent = usingSample ? '※ 연습용 샘플 데이터입니다. 실제 주가는 data/prices.json 이 올라오면 표시돼요.' : '';
   patchSettings({last:code});
   renderWatch(); draw();
@@ -268,7 +269,7 @@ function renderAll(){
   if(!selCode){
     const list = live('watch');
     const pick = list.find(w=>w.code===last) || list[0];
-    if(pick){ selCode=pick.code; candles=candlesFor(selCode); $ttl.textContent=(pick.name?pick.name+' ':'')+pick.code; $note.textContent = usingSample?'※ 연습용 샘플 데이터입니다. 실제 주가는 data/prices.json 이 올라오면 표시돼요.':''; renderWatch(); }
+    if(pick){ selCode=pick.code; candles=candlesFor(selCode); $ttl.textContent=(nameOf(pick.code,pick)?nameOf(pick.code,pick)+' ':'')+pick.code; $note.textContent = usingSample?'※ 연습용 샘플 데이터입니다. 실제 주가는 data/prices.json 이 올라오면 표시돼요.':''; renderWatch(); }
   }
   draw();
 }
@@ -278,7 +279,7 @@ document.getElementById('btnAdd').onclick = () => {
   const name = document.getElementById('inName').value.trim();
   if(!/^\d{6}$/.test(code)){ alert('종목코드는 숫자 6자리예요. 예: 005930'); return; }
   if(live('watch').some(w=>w.code===code)){ select(code); return; }
-  put({id:'watch:'+code, type:'watch', code, name: name || (PRICES&&PRICES[code]?PRICES[code].name:''), createdAt:Date.now()});
+  put({id:'watch:'+code, type:'watch', code, name: name, createdAt:Date.now()});
   document.getElementById('inCode').value=''; document.getElementById('inName').value='';
   select(code);
 };
